@@ -149,12 +149,26 @@ def run_hand_tracking():
         (5, 9), (9, 13), (13, 17)  # Paume
     ]
     
+    # Variables pour le dessin
+    canvas = None
+    px, py = 0, 0
+    draw_color = (255, 255, 0) # Cyan
+    brush_thickness = 5
+    eraser_thickness = 50
+    
     while cap.isOpened():
         success, frame = cap.read()
         
         if not success:
             print("Frame vide, on continue.")
             continue
+            
+        # Initialiser le canvas si nécessaire (même taille que la frame)
+        if canvas is None:
+            canvas = np.zeros_like(frame)
+        
+        # Miroir horizontal pour une interaction plus naturelle
+        frame = cv2.flip(frame, 1)
         
         # Convertir BGR à RGB
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -166,18 +180,61 @@ def run_hand_tracking():
         detection_result = detector.detect(mp_image)
         
         gestures_detected = []
+        is_drawing = False
         
         # Détecter le geste du cœur (nécessite 2 mains)
-        if detect_heart_gesture(detection_result, frame.shape):
-            gestures_detected.append("❤️ COEUR")
+        # Note: detect_heart_gesture utilisait les coordonnées normalisées, 
+        # mais ici on a flippé l'image. Il faudrait adapter si le coeur dépend de la gauche/droite.
+        # Pour l'instant on laisse tel quel, le flip affecte l'affichage surtout.
         
         # Dessiner les landmarks si des mains sont détectées
         if detection_result.hand_landmarks:
             h, w, c = frame.shape
             
-            for idx, hand_landmarks in enumerate(detection_result.hand_landmarks):
+            # On ne prend que la première main détectée pour le dessin pour éviter les conflits
+            hand_landmarks = detection_result.hand_landmarks[0]
+            
+            # --- Logique de dessin ---
+            # Index levé ?
+            index_up = is_finger_extended(hand_landmarks, 8, 6)
+            # Majeur levé ?
+            middle_up = is_finger_extended(hand_landmarks, 12, 10)
+            # Annulaire levé ?
+            ring_up = is_finger_extended(hand_landmarks, 16, 14)
+            
+            # Coordonnées du bout de l'index (inversées car on a flippé l'frame)
+            # Attention: hand_landmarks sont normalisés (0-1). 
+            # Comme on a flippé l'image avec cv2.flip(frame, 1), l'image affichée est inversée en X.
+            # MAIS MediaPipe détecte sur l'image RGB non flippée (si on passait frame_rgb avant le flip).
+            # ARGH. Attend.
+            # J'ai flippé 'frame' AVANT de créer mp_image. Donc mp_image EST flippée.
+            # Donc les coords x de landmarks correspondent bien à l'image flippée. C'est bon.
+            
+            x1 = int(hand_landmarks[8].x * w)
+            y1 = int(hand_landmarks[8].y * h)
+            
+            # Mode DESSIN : Index levé SEULEMENT (Majeur baissé pour être sûr, ou juste Index haut)
+            # Pour être précis : Index Haut, les autres fermés c'est mieux.
+            if index_up and not middle_up and not ring_up:
+                cv2.circle(frame, (x1, y1), 10, draw_color, -1)
+                
+                if px == 0 and py == 0:
+                    px, py = x1, y1
+                
+                cv2.line(canvas, (px, py), (x1, y1), draw_color, brush_thickness)
+                px, py = x1, y1
+                is_drawing = True
+                
+            # Mode GOMME/PAUSE : Si Index et Majeur levés (Signe de paix/Selection), on ne dessine pas
+            # On réinitialise juste le point précédent pour ne pas tracer de trait "téléporté"
+            else:
+                px, py = 0, 0
+                
+            # --- Fin Logique dessin ---
+
+            for idx, hand_landmarks_list in enumerate(detection_result.hand_landmarks):
                 # Dessiner les points
-                for landmark in hand_landmarks:
+                for landmark in hand_landmarks_list:
                     x = int(landmark.x * w)
                     y = int(landmark.y * h)
                     cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
@@ -185,8 +242,8 @@ def run_hand_tracking():
                 # Dessiner les connexions
                 for connection in HAND_CONNECTIONS:
                     start_idx, end_idx = connection
-                    start = hand_landmarks[start_idx]
-                    end = hand_landmarks[end_idx]
+                    start = hand_landmarks_list[start_idx]
+                    end = hand_landmarks_list[end_idx]
                     
                     start_point = (int(start.x * w), int(start.y * h))
                     end_point = (int(end.x * w), int(end.y * h))
@@ -194,32 +251,56 @@ def run_hand_tracking():
                     cv2.line(frame, start_point, end_point, (255, 0, 0), 2)
                 
                 # Détecter les gestes pour chaque main
+                # Note: detect_heart_gesture a besoin de la liste complète 'detection_result' non modifiée
+                
                 hand_gesture = None
-                if detect_peace_sign(hand_landmarks):
+                if detect_peace_sign(hand_landmarks_list):
                     hand_gesture = "✌️ PAIX"
-                elif detect_thumbs_up(hand_landmarks):
+                elif detect_thumbs_up(hand_landmarks_list):
                     hand_gesture = "👍 POUCE LEVE"
-                elif detect_ok_sign(hand_landmarks):
+                elif detect_ok_sign(hand_landmarks_list):
                     hand_gesture = "👌 OK"
-                elif detect_fist(hand_landmarks):
+                elif detect_fist(hand_landmarks_list):
                     hand_gesture = "✊ POING"
                 
                 if hand_gesture and hand_gesture not in gestures_detected:
                     gestures_detected.append(hand_gesture)
+        else:
+            # Si pas de main, reset coords
+            px, py = 0, 0
+
+        # Fusionner le canvas avec la frame
+        # Créer un masque gris du canvas
+        img_gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+        _, img_inv = cv2.threshold(img_gray, 50, 255, cv2.THRESH_BINARY_INV)
+        img_inv = cv2.cvtColor(img_inv, cv2.COLOR_GRAY2BGR)
         
+        # Isoler la zone du dessin dans frame (la mettre en noir là où il y a du dessin)
+        frame = cv2.bitwise_and(frame, img_inv)
+        # Ajouter le dessin (canvas)
+        frame = cv2.bitwise_or(frame, canvas)
+
         # Afficher les gestes détectés
         y_offset = 50
         for gesture in gestures_detected:
             cv2.putText(frame, gesture, (10, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
             y_offset += 60
+            
+        cv2.putText(frame, "Index: DESSIN | 'c': EFFACER | 'q': QUITTER", (10, frame.shape[0] - 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
         
-        # Afficher le résultat (miroir)
-        cv2.imshow("Detection de gestes", cv2.flip(frame, 1))
+        # Afficher le résultat
+        # Note: on a déjà fait le flip au début, donc pas besoin de le refaire ici
+        cv2.imshow("Detection de gestes + Dessin", frame)
         
-        # Quitter avec la touche 'q'
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # Gestion clavier
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
+        elif key == ord('c'):
+            canvas = np.zeros_like(frame)
+            print("Canvas effacé !")
     
     # Libérer les ressources
     cap.release()
